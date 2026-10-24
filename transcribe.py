@@ -1,139 +1,120 @@
-#!/usr/bin/env python3
+#!/Users/darkknight/.transcribe-venv/bin/python3
 """
 Whisper + Pyannote all-in-one transcription tool
 Usage: transcribe yourfile.mp4
 """
 
 import sys
-import json
-import subprocess
+import os
 from pathlib import Path
 from datetime import timedelta
 
 
 def format_time(seconds):
-    """Convert seconds to HH:MM:SS format"""
-    td = timedelta(seconds=seconds)
-    hours, remainder = divmod(int(td.total_seconds()), 3600)
-    minutes, seconds = divmod(remainder, 60)
-    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    hours, remainder = divmod(int(seconds), 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
 def get_hf_token():
-    """Get HuggingFace token from environment or ask user"""
-    import os
     token = os.environ.get('HF_TOKEN')
     if token:
         return token
-    
+
+    token_file = Path.home() / '.hf_token'
+    if token_file.exists():
+        return token_file.read_text().strip()
+
     print("\n⚠️  First time setup: You need a HuggingFace token for speaker diarization.")
     print("1. Go to: https://huggingface.co/settings/tokens")
     print("2. Create a new token (read access is fine)")
     print("3. Paste it here:")
     token = input().strip()
-    
+
     if not token:
         print("❌ No token provided. Exiting.")
         sys.exit(1)
-    
-    print("✓ Token saved. You won't need to paste it again (set HF_TOKEN env var to skip this).")
+
+    token_file.write_text(token)
+    print(f"✓ Token saved to {token_file}. You won't need to paste it again.")
     return token
 
 
 def transcribe_with_speakers(file_path):
-    """Transcribe with speaker diarization and timecodes"""
-    
     file_path = Path(file_path).resolve()
-    
+
     if not file_path.exists():
         print(f"❌ File not found: {file_path}")
         sys.exit(1)
-    
+
     print(f"\n📹 Transcribing: {file_path.name}")
     print("This may take a while depending on file length...\n")
-    
-    # Get HF token
+
     hf_token = get_hf_token()
-    
-    # Step 1: Get speaker diarization
+
+    # Step 1: Speaker diarization
     print("🎤 Identifying speakers...")
     try:
-        diarization_result = subprocess.run(
-            ['pyannote-speaker-diarization', str(file_path), '--token', hf_token],
-            capture_output=True,
-            text=True,
-            timeout=7200
+        from pyannote.audio import Pipeline
+        pipeline = Pipeline.from_pretrained(
+            "pyannote/speaker-diarization-3.1",
+            token=hf_token
         )
-        if diarization_result.returncode != 0:
-            print(f"❌ Speaker diarization failed: {diarization_result.stderr}")
-            sys.exit(1)
-        
-        diarization_data = json.loads(diarization_result.stdout)
-    except subprocess.TimeoutExpired:
-        print("❌ Diarization timed out (file too long)")
-        sys.exit(1)
+        result = pipeline(str(file_path))
+        # pyannote.audio 4 wraps the Annotation in a DiarizeOutput
+        if hasattr(result, 'speaker_diarization'):
+            annotation = result.speaker_diarization
+        elif hasattr(result, 'diarization'):
+            annotation = result.diarization
+        else:
+            annotation = result
     except Exception as e:
         print(f"❌ Diarization error: {e}")
         sys.exit(1)
-    
+
+    speaker_segments = [
+        (turn.start, turn.end, speaker)
+        for turn, _, speaker in annotation.itertracks(yield_label=True)
+    ]
+
     # Step 2: Transcribe with Whisper
     print("🎙️  Transcribing audio...")
     try:
-        whisper_result = subprocess.run(
-            ['whisper', str(file_path), '--output_format', 'json', '--quiet'],
-            capture_output=True,
-            text=True,
-            timeout=7200
-        )
-        if whisper_result.returncode != 0:
-            print(f"❌ Whisper transcription failed: {whisper_result.stderr}")
-            sys.exit(1)
-        
-        whisper_data = json.loads(whisper_result.stdout)
-    except subprocess.TimeoutExpired:
-        print("❌ Transcription timed out (file too long)")
-        sys.exit(1)
+        import whisper
+        model = whisper.load_model("base")
+        result = model.transcribe(str(file_path))
     except Exception as e:
         print(f"❌ Transcription error: {e}")
         sys.exit(1)
-    
-    # Step 3: Merge speaker info with transcription
+
+    # Step 3: Merge
     print("🔗 Merging speaker info with transcript...")
-    
-    segments = whisper_data.get('segments', [])
-    speakers = diarization_data.get('speakers', {})
-    
-    # Build output transcript
-    transcript_lines = []
-    transcript_lines.append(f"TRANSCRIPT: {file_path.name}\n")
-    transcript_lines.append("=" * 60 + "\n")
-    
-    for segment in segments:
-        start_time = segment['start']
-        end_time = segment['end']
+
+    def get_speaker(time):
+        for start, end, speaker in speaker_segments:
+            if start <= time < end:
+                return speaker
+        return "Unknown"
+
+    transcript_lines = [
+        f"TRANSCRIPT: {file_path.name}\n",
+        "=" * 60 + "\n",
+    ]
+
+    for segment in result.get('segments', []):
         text = segment['text'].strip()
-        
         if not text:
             continue
-        
-        # Find which speaker is active at this time
-        speaker_label = "Unknown"
-        for spk, (spk_start, spk_end) in speakers.items():
-            if spk_start <= start_time < spk_end:
-                speaker_label = spk
-                break
-        
-        timestamp = format_time(start_time)
-        transcript_lines.append(f"[{timestamp}] {speaker_label}: {text}\n")
-    
-    # Write output
+        timestamp = format_time(segment['start'])
+        speaker = get_speaker(segment['start'])
+        transcript_lines.append(f"[{timestamp}] {speaker}: {text}\n")
+
     output_file = file_path.with_suffix('.txt')
     with open(output_file, 'w') as f:
         f.writelines(transcript_lines)
-    
+
     print(f"\n✅ Done! Transcript saved to: {output_file}\n")
-    
-    # Show preview
+
     print("Preview:")
     print("=" * 60)
     for line in transcript_lines[:20]:
@@ -146,6 +127,5 @@ if __name__ == '__main__':
     if len(sys.argv) < 2:
         print("Usage: transcribe yourfile.mp4")
         sys.exit(1)
-    
-    file_path = sys.argv[1]
-    transcribe_with_speakers(file_path)
+
+    transcribe_with_speakers(sys.argv[1])
