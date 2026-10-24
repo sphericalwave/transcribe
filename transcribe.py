@@ -61,7 +61,13 @@ def transcribe_with_speakers(file_path):
             token=hf_token
         )
         result = pipeline(str(file_path))
-        annotation = result.diarization if hasattr(result, 'diarization') else result
+        # pyannote.audio 4 wraps the Annotation in a DiarizeOutput
+        if hasattr(result, 'speaker_diarization'):
+            annotation = result.speaker_diarization
+        elif hasattr(result, 'diarization'):
+            annotation = result.diarization
+        else:
+            annotation = result
     except Exception as e:
         print(f"❌ Diarization error: {e}")
         sys.exit(1)
